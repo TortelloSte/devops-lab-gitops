@@ -14,6 +14,6 @@ spec:
     spec:
       containers:
         - name: nginx
-          image: nginx:alpine
+          image: ghcr.io/tortelloste/devops-lab-demo@sha256:aab3aef827bebac6295199e53251aa86b0f30ddf717f175397c5ad98a83f5ad0
           ports:
             - containerPort: 80
