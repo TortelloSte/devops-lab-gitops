@@ -1,4 +1,4 @@
-name: CI - Secure Build and Publish
+name: CI/CD - Secure GitOps Delivery
 
 on:
   push:
@@ -21,11 +21,11 @@ env:
 
 jobs:
   build:
-    name: Build, scan, SBOM and sign
+    name: Build, scan, SBOM, sign and deploy
     runs-on: ubuntu-latest
 
     permissions:
-      contents: read
+      contents: write
       packages: write
       id-token: write
 
@@ -67,7 +67,7 @@ jobs:
           upload-release-assets: false
 
       - name: Upload SBOM artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: sbom-${{ github.sha }}
           path: sbom.spdx.json
@@ -128,3 +128,37 @@ jobs:
           cosign verify "${IMAGE_REF}" \
             --certificate-identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/ci.yml@refs/heads/${GITHUB_REF_NAME}" \
             --certificate-oidc-issuer="https://token.actions.githubusercontent.com"
+
+      - name: Update GitOps deployment manifest
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        env:
+          IMAGE_REF: ${{ steps.publish.outputs.image_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sed -i -E \
+            "s|^([[:space:]]*)image:.*$|\1image: ${IMAGE_REF}|" \
+            apps/demo/deployment.yaml
+
+          grep -n "image:" apps/demo/deployment.yaml
+
+      - name: Commit GitOps deployment update
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add apps/demo/deployment.yaml
+
+          if git diff --cached --quiet; then
+            echo "Deployment manifest already points to this image digest."
+            exit 0
+          fi
+
+          short_sha="${GITHUB_SHA::7}"
+          git commit -m "chore(gitops): deploy ${short_sha} [skip ci]"
+          git push origin HEAD:main
