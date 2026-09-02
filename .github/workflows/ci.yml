@@ -1,4 +1,4 @@
-name: CI - Build and Publish
+name: CI - Secure Build and Publish
 
 on:
   push:
@@ -13,18 +13,21 @@ on:
     paths:
       - "app/**"
       - ".github/workflows/ci.yml"
-
-permissions:
-  contents: read
-  packages: write
+  workflow_dispatch:
 
 env:
   IMAGE_NAME: ghcr.io/tortelloste/devops-lab-demo
+  LOCAL_IMAGE: devops-lab-demo:ci
 
 jobs:
   build:
-    name: Build container image
+    name: Build, scan, SBOM and sign
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
 
     steps:
       - name: Checkout repository
@@ -33,29 +36,94 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      - name: Build image for security checks
+        uses: docker/build-push-action@v7
+        with:
+          context: ./app
+          load: true
+          push: false
+          tags: ${{ env.LOCAL_IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.LOCAL_IMAGE }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@v0.24.0
+        with:
+          image: ${{ env.LOCAL_IMAGE }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom.spdx.json
+          retention-days: 30
+
       - name: Log in to GHCR
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Generate image metadata
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ env.IMAGE_NAME }}
-          tags: |
-            type=sha,prefix=sha-
-            type=raw,value=latest,enable={{is_default_branch}}
+      - name: Publish image and resolve digest
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        id: publish
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      - name: Build and push image
-        uses: docker/build-push-action@v7
-        with:
-          context: ./app
-          push: ${{ github.event_name == 'push' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          short_sha="${GITHUB_SHA::7}"
+          sha_tag="${IMAGE_NAME}:sha-${short_sha}"
+          latest_tag="${IMAGE_NAME}:latest"
+
+          docker tag "${LOCAL_IMAGE}" "${sha_tag}"
+          docker tag "${LOCAL_IMAGE}" "${latest_tag}"
+
+          docker push "${sha_tag}"
+          docker push "${latest_tag}"
+
+          manifest_json="$(docker buildx imagetools inspect "${sha_tag}" --format '{{json .Manifest}}')"
+          digest="$(jq -r '.digest' <<< "${manifest_json}")"
+
+          if [[ -z "${digest}" || "${digest}" == "null" ]]; then
+            echo "Unable to resolve published image digest" >&2
+            exit 1
+          fi
+
+          echo "sha_tag=${sha_tag}" >> "${GITHUB_OUTPUT}"
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+          echo "image_ref=${IMAGE_NAME}@${digest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install Cosign
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: sigstore/cosign-installer@v4.1.2
+
+      - name: Sign image with GitHub OIDC
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        env:
+          IMAGE_REF: ${{ steps.publish.outputs.image_ref }}
+        run: cosign sign --yes "${IMAGE_REF}"
+
+      - name: Verify image signature
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        env:
+          IMAGE_REF: ${{ steps.publish.outputs.image_ref }}
+        run: |
+          cosign verify "${IMAGE_REF}" \
+            --certificate-identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/ci.yml@refs/heads/${GITHUB_REF_NAME}" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com"
